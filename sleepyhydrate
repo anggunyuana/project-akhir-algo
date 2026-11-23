@@ -1,0 +1,815 @@
+import os
+import psycopg2
+import psycopg2.extras
+from datetime import datetime, date
+
+# ---------- VARIABEL TETAP (KONSTANTA) ----------
+BATAS_AIR = 3000                # maksimal air per hari (ml)
+TARGET_AWAL = 2000              # target awal minum per hari (ml)
+MIN_SANDI = 3                   # panjang minimal kata sandi
+MAKS_SANDI = 6                  # panjang maksimal kata sandi
+MAKS_TIDUR = 6 * 60             # durasi tidur maksimal yang dicatat (menit)
+BATAS_KURANG_TIDUR = 5 * 60     # di bawah ini = kurang tidur (menit)
+
+# ---------- VARIABEL GLOBAL ----------
+db = None               # koneksi ke database
+pengguna_aktif = None   # dictionary user yang sedang login
+ROLE_ORTU = None        # id_role orang tua
+ROLE_ANAK = None        # id_role anak
+
+#  BAGIAN 1 : KONEKSI DATABASE & FUNGSI BANTU
+def buat_koneksi():
+    """Menyambungkan program ke database PostgreSQL."""
+    try:
+        koneksi = psycopg2.connect(
+            host="localhost",
+            port=5432,
+            user="postgres",          # ganti sesuai user PostgreSQL kamu
+            password="vanesya27",         # ganti dengan password PostgreSQL kamu
+            dbname="db_sleepyhydrate"
+        )
+        koneksi.autocommit = True
+        return koneksi
+    except psycopg2.Error as error:
+        print("Gagal terhubung ke database:", error)
+        return None
+
+def main():
+    global db
+    db = buat_koneksi()
+    if db is None:
+        print("Program berhenti karena database tidak terhubung.")
+        return
+    inisialisasi_data()
+    menu_awal()
+    db.close()
+
+def ambil_semua(query, isi=()):
+    """Menjalankan SELECT dan mengembalikan semua baris (list of dictionary)."""
+    cursor = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute(query, isi)
+    hasil = cursor.fetchall()
+    cursor.close()
+    return hasil
+
+def ambil_satu(query, isi=()):
+    """Menjalankan SELECT dan mengembalikan satu baris (atau None)."""
+    cursor = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute(query, isi)
+    hasil = cursor.fetchone()
+    cursor.close()
+    return hasil
+
+def jalankan(query, isi=()):
+    """Menjalankan INSERT / UPDATE / DELETE."""
+    cursor = db.cursor()
+    cursor.execute(query, isi)
+    cursor.close()
+
+def bersihkan_layar():
+    """Membersihkan layar terminal."""
+    if os.name == "nt":
+        os.system("cls")
+    else:
+        os.system("clear")
+
+def jeda():
+    """Menahan layar supaya hasil sempat dibaca."""
+    input("\nTekan Enter untuk lanjut...")
+
+def konfirmasi_ya(teks):
+    """Konfirmasi: 'ya', 'YA', 'Ya', atau 'yA' semuanya dianggap setuju."""
+    jawaban = input(teks).strip().lower()
+    return jawaban == "ya"
+
+def id_berikutnya(nama_tabel, nama_kolom):
+    """Mencari nomor ID berikutnya (kolom ID tidak auto-increment)."""
+    hasil = ambil_satu(
+        f"SELECT COALESCE(MAX({nama_kolom}), 0) + 1 AS id_baru FROM {nama_tabel}"
+    )
+    return hasil["id_baru"]
+
+def minta_angka(teks, minimal, maksimal):
+    """Meminta input angka sampai user mengisi dengan benar."""
+    while True:
+        isi = input(teks)
+        if isi.isdigit():
+            angka = int(isi)
+            if angka >= minimal and angka <= maksimal:
+                return angka
+            print(f"Angka harus antara {minimal} sampai {maksimal}!")
+        else:
+            print("Input harus berupa angka!")
+
+def format_durasi(menit):
+    """Mengubah menit menjadi tulisan 'x jam y menit'."""
+    return f"{menit // 60} jam {menit % 60} menit"
+
+def sandi_valid(sandi):
+    """Cek panjang kata sandi (3 sampai 6 karakter, huruf/angka bebas)."""
+    if len(sandi) < MIN_SANDI or len(sandi) > MAKS_SANDI:
+        print(f"Kata sandi harus {MIN_SANDI} sampai {MAKS_SANDI} karakter!")
+        return False
+    return True
+
+def status_tidur(menit):
+    """Mengembalikan 'KURANG TIDUR' kalau tidur kurang dari batas, atau None kalau cukup."""
+    if menit < BATAS_KURANG_TIDUR:
+        return "KURANG TIDUR"
+    else:
+        return None
+
+def username_sudah_ada(username):
+    """Cek apakah username sudah dipakai."""
+    hasil = ambil_satu("SELECT id_pengguna FROM pengguna WHERE username = %s", (username,))
+    return hasil is not None
+
+def nama_sudah_ada(nama):
+    """Cek apakah nama pengguna sudah dipakai."""
+    hasil = ambil_satu("SELECT id_pengguna FROM pengguna WHERE nama_pengguna = %s", (nama,))
+    return hasil is not None
+
+def ambil_pengguna(id_pengguna):
+    """Mengambil data pengguna beserta nama rolenya."""
+    return ambil_satu(
+        "SELECT p.*, r.nama_role FROM pengguna p "
+        "JOIN role r ON p.id_role = r.id_role "
+        "WHERE p.id_pengguna = %s",
+        (id_pengguna,)
+    )
+
+def refresh_pengguna():
+    """Mengambil ulang data user yang login dari database."""
+    global pengguna_aktif
+    pengguna_aktif = ambil_pengguna(pengguna_aktif["id_pengguna"])
+
+def hapus_data_pengguna(id_pengguna):
+    """Menghapus catatan tidur, catatan minum, lalu akun penggunanya."""
+    jalankan("DELETE FROM catatan_tidur WHERE id_pengguna = %s", (id_pengguna,))
+    jalankan("DELETE FROM catatan_minum WHERE id_pengguna = %s", (id_pengguna,))
+    jalankan("DELETE FROM pengguna WHERE id_pengguna = %s", (id_pengguna,))
+
+def cari_id_role(nama_role):
+    """Mencari id_role dari namanya. Kalau belum ada, dibuat dulu."""
+    hasil = ambil_satu("SELECT id_role FROM role WHERE nama_role = %s", (nama_role,))
+    if hasil is None:
+        jalankan("INSERT INTO role (nama_role) VALUES (%s)", (nama_role,))
+        hasil = ambil_satu("SELECT id_role FROM role WHERE nama_role = %s", (nama_role,))
+    return hasil["id_role"]
+
+def inisialisasi_data():
+    """Menambah kolom id_ortu bila belum ada, lalu menyiapkan role orangtua & anak."""
+    global ROLE_ORTU, ROLE_ANAK
+    jalankan("ALTER TABLE pengguna ADD COLUMN IF NOT EXISTS id_ortu INTEGER")
+    ROLE_ORTU = cari_id_role("orangtua")
+    ROLE_ANAK = cari_id_role("anak")
+
+#  BAGIAN 2 : REGISTRASI & LOGIN
+def menu_awal():
+    """Menu pertama saat program dijalankan."""
+    while True:
+        bersihkan_layar()
+        print("==============================")
+        print("        SLEEPYHYDRATE")
+        print("==============================")
+        print("1. Registrasi (Orang tua)")
+        print("2. Login")
+        print("3. Selesai")
+        pilihan = input("Pilih menu: ")
+        bersihkan_layar()
+
+        match pilihan:
+            case "1":
+                registrasi()
+                jeda()
+            case "2":
+                login()
+                jeda()
+                if pengguna_aktif is not None:
+                    menu_utama()
+            case "3":
+                print("Terima kasih sudah memakai SleepyHydrate. Tetap sehat!")
+                return
+            case _:
+                print("Pilihan tidak valid!")
+                jeda()
+
+def registrasi():
+    """Registrasi akun orang tua."""
+    print("--- REGISTRASI ORANG TUA ---")
+    nama = input("Nama lengkap : ").strip()
+    username = input("Username     : ").strip()
+    sandi = input(f"Kata sandi ({MIN_SANDI}-{MAKS_SANDI} karakter) : ").strip()
+
+    if nama == "" or username == "" or sandi == "":
+        print("Semua data wajib diisi!")
+        return
+    if not sandi_valid(sandi):
+        return
+    if nama_sudah_ada(nama):
+        print("Nama sudah dipakai, gunakan nama yang berbeda!")
+        return
+    if username_sudah_ada(username):
+        print("Username sudah dipakai, gunakan username lain!")
+        return
+
+    jalankan(
+        "INSERT INTO pengguna (id_pengguna, id_role, nama_pengguna, username, password, target_harian) "
+        "VALUES (%s, %s, %s, %s, %s, %s)",
+        (id_berikutnya("pengguna", "id_pengguna"), ROLE_ORTU, nama, username, sandi, TARGET_AWAL)
+    )
+    print("Registrasi berhasil! Silakan login.")
+
+def login():
+    """Login memakai username dan kata sandi."""
+    global pengguna_aktif
+    print("--- LOGIN ---")
+    username = input("Username    : ").strip()
+    sandi = input("Kata sandi : ").strip()
+
+    user = ambil_satu(
+        "SELECT p.*, r.nama_role FROM pengguna p "
+        "JOIN role r ON p.id_role = r.id_role "
+        "WHERE p.username = %s AND p.password = %s",
+        (username, sandi)
+    )
+
+    if user is None:
+        print("Username atau kata sandi salah!")
+    else:
+        pengguna_aktif = user
+        print(f"Login berhasil. Selamat datang, {user['nama_pengguna']}!")
+
+def menu_utama():
+    """Menu utama setelah login. Berbeda untuk orang tua dan anak."""
+    global pengguna_aktif
+    while pengguna_aktif is not None:
+        ortu = pengguna_aktif["id_role"] == ROLE_ORTU
+
+        bersihkan_layar()
+        print(f"=== MENU UTAMA ({pengguna_aktif['nama_pengguna']} - {pengguna_aktif['nama_role']}) ===")
+        print("1. Akun")
+        print("2. Catatan Tidur")
+        print("3. Catatan Minum")
+        print("4. Korelasi Kesehatan")
+        if ortu:
+            print("5. Pantau Anak")
+        print("0. Logout")
+        pilihan = input("Pilih menu: ")
+        bersihkan_layar()
+
+        match pilihan:
+            case "1":
+                menu_akun()
+            case "2":
+                menu_tidur()
+            case "3":
+                menu_minum()
+            case "4":
+                korelasi_kesehatan(pengguna_aktif["id_pengguna"], pengguna_aktif["nama_pengguna"])
+                jeda()
+            case "5" if ortu:
+                menu_pantau_anak()
+            case "0":
+                pengguna_aktif = None
+                print("Kamu sudah logout.")
+                jeda()
+            case _:
+                print("Pilihan tidak valid!")
+                jeda()
+
+#  BAGIAN 3 : AKUN
+def menu_akun():
+    """Menu akun: lihat, edit, hapus."""
+    while True:
+        bersihkan_layar()
+        lihat_profil()
+        print("\n1. Edit profil")
+        print("2. Hapus akun")
+        print("0. Kembali")
+        pilihan = input("Pilih menu: ")
+        bersihkan_layar()
+
+        match pilihan:
+            case "1":
+                edit_profil()
+                jeda()
+            case "2":
+                terhapus = hapus_akun()
+                jeda()
+                if terhapus:
+                    return
+            case "0":
+                return
+            case _:
+                print("Pilihan tidak valid!")
+                jeda()
+
+def lihat_profil():
+    """Menampilkan data akun yang sedang login."""
+    refresh_pengguna()
+    print("--- PROFIL ---")
+    print("Nama         :", pengguna_aktif["nama_pengguna"])
+    print("Username     :", pengguna_aktif["username"])
+    print("Peran        :", pengguna_aktif["nama_role"])
+    print("Target minum :", pengguna_aktif["target_harian"], "ml/hari")
+
+def edit_profil():
+    """Mengubah nama, username, atau kata sandi (kosongkan jika tidak diubah)."""
+    print("--- EDIT PROFIL (kosongkan jika tidak diubah) ---")
+    nama_baru = input("Nama baru       : ").strip()
+    username_baru = input("Username baru   : ").strip()
+    sandi_baru = input(f"Kata sandi baru ({MIN_SANDI}-{MAKS_SANDI} karakter) : ").strip()
+    id_saya = pengguna_aktif["id_pengguna"]
+
+    if nama_baru != "":
+        if nama_sudah_ada(nama_baru):
+            print("Nama itu sudah dipakai, nama tidak diubah.")
+        else:
+            jalankan("UPDATE pengguna SET nama_pengguna = %s WHERE id_pengguna = %s",
+                     (nama_baru, id_saya))
+
+    if username_baru != "":
+        if username_sudah_ada(username_baru):
+            print("Username itu sudah dipakai, username tidak diubah.")
+        else:
+            jalankan("UPDATE pengguna SET username = %s WHERE id_pengguna = %s",
+                     (username_baru, id_saya))
+
+    if sandi_baru != "":
+        if sandi_valid(sandi_baru):
+            jalankan("UPDATE pengguna SET password = %s WHERE id_pengguna = %s",
+                     (sandi_baru, id_saya))
+        else:
+            print("Kata sandi tidak diubah.")
+
+    refresh_pengguna()
+    print("Proses edit profil selesai.")
+
+def hapus_akun():
+    """Menghapus akun sendiri. Mengembalikan True kalau akun terhapus."""
+    global pengguna_aktif
+
+    ortu = pengguna_aktif["id_role"] == ROLE_ORTU
+    if ortu:
+        print("PERINGATAN: menghapus akun orang tua juga menghapus SEMUA akun anak.")
+        yakin = konfirmasi_ya("Yakin menghapus akun orang tua? Ketik ya untuk lanjut: ")
+    else:
+        yakin = konfirmasi_ya("Yakin menghapus akun anak? Ketik ya untuk lanjut: ")
+
+    if not yakin:
+        print("Penghapusan dibatalkan.")
+        return False
+
+    # kalau orang tua dihapus, semua akun anaknya ikut dihapus
+    if ortu:
+        for anak in daftar_anak(pengguna_aktif["id_pengguna"]):
+            hapus_data_pengguna(anak["id_pengguna"])
+
+    hapus_data_pengguna(pengguna_aktif["id_pengguna"])
+    pengguna_aktif = None
+    print("Akun berhasil dihapus.")
+    return True
+
+#  BAGIAN 4 : CATATAN TIDUR
+def menu_tidur():
+    """Menu catatan tidur."""
+    id_pengguna = pengguna_aktif["id_pengguna"]
+    while True:
+        bersihkan_layar()
+        print("=== CATATAN TIDUR ===")
+        print("1. Mulai tidur")
+        print("2. Bangun tidur")
+        print("3. Riwayat tidur")
+        print("0. Kembali")
+        pilihan = input("Pilih menu: ")
+        bersihkan_layar()
+
+        match pilihan:
+            case "1":
+                mulai_tidur(id_pengguna)
+                jeda()
+            case "2":
+                bangun_tidur(id_pengguna)
+                jeda()
+            case "3":
+                riwayat_tidur(id_pengguna)
+                jeda()
+            case "0":
+                return
+            case _:
+                print("Pilihan tidak valid!")
+                jeda()
+
+def mulai_tidur(id_pengguna):
+    """Mencatat waktu mulai tidur."""
+    belum_selesai = ambil_satu(
+        "SELECT * FROM catatan_tidur WHERE id_pengguna = %s AND waktu_bangun IS NULL",
+        (id_pengguna,)
+    )
+    if belum_selesai is not None:
+        print("Kamu masih tercatat tidur. Pilih 'Bangun tidur' dulu!")
+        return
+
+    sekarang = datetime.now()
+    jalankan(
+        "INSERT INTO catatan_tidur (id_tidur, id_pengguna, tanggal, waktu_tidur) "
+        "VALUES (%s, %s, %s, %s)",
+        (id_berikutnya("catatan_tidur", "id_tidur"), id_pengguna,
+         sekarang.date(), sekarang.strftime("%H:%M:%S"))
+    )
+    print("Waktu mulai tidur dicatat:", sekarang.strftime("%H:%M"))
+    print("Selamat tidur!")
+
+def bangun_tidur(id_pengguna):
+    """Mencatat waktu bangun. Urutan: durasi -> peringatan kurang tidur -> kondisi tubuh."""
+    catatan = ambil_satu(
+        "SELECT * FROM catatan_tidur WHERE id_pengguna = %s AND waktu_bangun IS NULL "
+        "ORDER BY id_tidur DESC",
+        (id_pengguna,)
+    )
+    if catatan is None:
+        print("Belum ada catatan mulai tidur. Pilih 'Mulai tidur' dulu!")
+        return
+
+    # gabungkan tanggal + jam mulai tidur menjadi satu waktu lengkap
+    waktu_mulai = datetime.combine(catatan["tanggal"], catatan["waktu_tidur"])
+    sekarang = datetime.now()
+    durasi_menit = int((sekarang - waktu_mulai).total_seconds() // 60)
+
+    # batasi durasi tidur maksimal
+    if durasi_menit > MAKS_TIDUR:
+        durasi_menit = MAKS_TIDUR
+        print(f"Durasi tidur dibatasi maksimal {format_durasi(MAKS_TIDUR)}.")
+
+    # 1. tampilkan durasi tidur
+    print("Selamat pagi! Kamu tidur selama", format_durasi(durasi_menit))
+
+    # 2. tampilkan peringatan kurang tidur (kalau tidurnya kurang)
+    peringatan = status_tidur(durasi_menit)
+    if peringatan is not None:
+        print(f"\n!!! {peringatan} !!!")
+        print(f"Kamu tidur kurang dari {BATAS_KURANG_TIDUR // 60} jam. "
+              "Usahakan tidur lebih cukup malam ini.")
+
+    # 3. baru setelah itu tanya kondisi tubuh
+    kebugaran = pilih_kebugaran()
+
+    jalankan(
+        "UPDATE catatan_tidur SET waktu_bangun = %s, durasi_tidur = %s, kebugaran = %s "
+        "WHERE id_tidur = %s",
+        (sekarang.strftime("%H:%M:%S"), durasi_menit, kebugaran, catatan["id_tidur"])
+    )
+    print("\nKondisi tubuh :", kebugaran)
+    print("Catatan tidur berhasil disimpan.")
+
+def pilih_kebugaran():
+    """Meminta user memilih kondisi tubuh setelah bangun."""
+    while True:
+        print("\nBagaimana kondisi tubuhmu sekarang?")
+        print("1. Segar")
+        print("2. Pusing")
+        print("3. Lemas")
+        pilihan = input("Pilih (1-3): ")
+
+        match pilihan:
+            case "1":
+                return "segar"
+            case "2":
+                return "pusing"
+            case "3":
+                return "lemas"
+            case _:
+                print("Pilihan tidak valid!")
+
+def riwayat_tidur(id_pengguna):
+    """Menampilkan 7 catatan tidur terakhir."""
+    data = ambil_semua(
+        "SELECT * FROM catatan_tidur WHERE id_pengguna = %s "
+        "ORDER BY id_tidur DESC LIMIT 7",
+        (id_pengguna,)
+    )
+    if len(data) == 0:
+        print("Belum ada catatan tidur.")
+        return
+
+    print("\n--- RIWAYAT TIDUR (7 terakhir) ---")
+    for d in data:
+        if d["waktu_bangun"] is None:
+            print(f"{d['tanggal']} | tidur {d['waktu_tidur']} | (masih tidur)")
+        else:
+            baris = (f"{d['tanggal']} | tidur {d['waktu_tidur']} | "
+                     f"bangun {d['waktu_bangun']} | "
+                     f"{format_durasi(d['durasi_tidur'])} | {d['kebugaran']}")
+            peringatan = status_tidur(d["durasi_tidur"])
+            if peringatan is not None:
+                baris = baris + " | ** " + peringatan + " **"
+            print(baris)
+
+#  BAGIAN 5 : CATATAN MINUM
+def menu_minum():
+    """Menu catatan minum."""
+    id_pengguna = pengguna_aktif["id_pengguna"]
+    while True:
+        refresh_pengguna()
+        ortu = pengguna_aktif["id_role"] == ROLE_ORTU
+        bersihkan_layar()
+        print("=== CATATAN MINUM ===")
+        total = total_air_tanggal(id_pengguna, date.today())
+        tampilkan_progress(total, pengguna_aktif["target_harian"])
+        print("\n1. Tambah minum")
+        print("2. Lihat riwayat hari ini")
+        if ortu:
+            print("3. Atur target harian")
+        print("0. Kembali")
+        pilihan = input("Pilih menu: ")
+        bersihkan_layar()
+
+        match pilihan:
+            case "1":
+                tambah_minum(id_pengguna)
+                jeda()
+            case "2":
+                riwayat_minum_hari_ini(id_pengguna)
+                jeda()
+            case "3" if ortu:
+                atur_target(id_pengguna)
+                jeda()
+            case "0":
+                return
+            case _:
+                print("Pilihan tidak valid!")
+                jeda()
+
+def tambah_minum(id_pengguna):
+    """Menambah catatan minum, maksimal 3 liter per hari."""
+    total = total_air_tanggal(id_pengguna, date.today())
+    sisa = BATAS_AIR - total
+    if sisa <= 0:
+        print("Batas input air hari ini (3 liter) sudah tercapai!")
+        return
+
+    print("Pilih jumlah air yang diminum:")
+    print("1. 250 ml (1 gelas)")
+    print("2. 500 ml (1 botol kecil)")
+    print("3. Isi sendiri")
+    pilihan = input("Pilih (1-3): ")
+
+    match pilihan:
+        case "1":
+            jumlah = 250
+        case "2":
+            jumlah = 500
+        case "3":
+            jumlah = minta_angka("Jumlah air (ml): ", 1, BATAS_AIR)
+        case _:
+            print("Pilihan tidak valid!")
+            return
+
+    if jumlah > sisa:
+        print(f"Melebihi batas! Kamu hanya bisa menambah maksimal {sisa} ml lagi hari ini.")
+        return
+
+    sekarang = datetime.now()
+    jalankan(
+        "INSERT INTO catatan_minum (id_pengguna, tanggal, jumlah_air, waktu_minum) "
+        "VALUES (%s, %s, %s, %s)",
+        (id_pengguna, sekarang.date(), jumlah, sekarang.strftime("%H:%M:%S"))
+    )
+    print(f"Berhasil mencatat {jumlah} ml.")  
+
+def atur_target(id_pengguna):
+    """Mengatur target minum harian."""
+    target_baru = minta_angka(f"Target baru (500 - {BATAS_AIR} ml): ", 500, BATAS_AIR)
+    jalankan("UPDATE pengguna SET target_harian = %s WHERE id_pengguna = %s",
+             (target_baru, id_pengguna))
+    print("Target minum berhasil diubah menjadi", target_baru, "ml.")
+
+def riwayat_minum_hari_ini(id_pengguna):
+    """Menampilkan semua catatan minum hari ini."""
+    data = ambil_semua(
+        "SELECT * FROM catatan_minum WHERE id_pengguna = %s AND tanggal = %s "
+        "ORDER BY waktu_minum",
+        (id_pengguna, date.today())
+    )
+    if len(data) == 0:
+        print("Belum ada catatan minum hari ini.")
+        return
+
+    print("--- RIWAYAT MINUM HARI INI ---")
+    for d in data:
+        print(f"{d['waktu_minum']} | {d['jumlah_air']} ml")
+  
+def total_air_tanggal(id_pengguna, tanggal):
+    """Menghitung total air yang diminum pada tanggal tertentu (ml)."""
+    hasil = ambil_satu(
+        "SELECT COALESCE(SUM(jumlah_air), 0) AS total FROM catatan_minum "
+        "WHERE id_pengguna = %s AND tanggal = %s",
+        (id_pengguna, tanggal)
+    )
+    return int(hasil["total"])
+
+def tampilkan_progress(total, target):
+    """Menampilkan progress bar dan persentase target minum."""
+    persen = total / target * 100
+    if persen > 100:
+        persen = 100
+    jumlah_blok = int(persen / 5)           # 20 blok = 100%
+    bar = "#" * jumlah_blok + "-" * (20 - jumlah_blok)
+    print(f"[{bar}] {persen:.0f}%  ({total} / {target} ml)")
+    if total >= target:
+        print("Target hari ini sudah tercapai. Hebat!")
+
+#  BAGIAN 6 : KORELASI KESEHATAN
+def korelasi_kesehatan(id_pengguna, nama):
+    """Menampilkan hubungan durasi tidur, air minum, dan kebugaran."""
+    data = ambil_semua(
+        "SELECT t.tanggal, t.durasi_tidur, t.kebugaran, "
+        "COALESCE((SELECT SUM(m.jumlah_air) FROM catatan_minum m "
+        "          WHERE m.id_pengguna = t.id_pengguna AND m.tanggal = t.tanggal), 0) AS total_air "
+        "FROM catatan_tidur t "
+        "WHERE t.id_pengguna = %s AND t.kebugaran IS NOT NULL "
+        "ORDER BY t.tanggal",
+        (id_pengguna,)
+    )
+
+    print(f"=== KORELASI KESEHATAN: {nama} ===")
+    if len(data) == 0:
+        print("Belum ada data lengkap (tidur + kebugaran) untuk dianalisis.")
+        return
+
+    # 1. tabel data
+    print("\nTanggal    | Tidur (jam) | Air (ml) | Kondisi")
+    print("-----------+-------------+----------+--------")
+    for d in data:
+        jam = d["durasi_tidur"] / 60
+        print(f"{d['tanggal']} | {jam:11.1f} | {int(d['total_air']):8d} | {d['kebugaran']}")
+
+    # 2. grafik sederhana durasi tidur (1 # = 1 jam)
+    print("\nGrafik durasi tidur (1 # = 1 jam):")
+    for d in data:
+        jam = d["durasi_tidur"] / 60
+        print(f"{d['tanggal']} | {'#' * round(jam)} {jam:.1f} jam")
+
+    # 3. rata-rata tiap kondisi kebugaran
+    print("\nRata-rata berdasarkan kondisi tubuh:")
+    rata_tidur = {}
+    rata_air = {}
+    for kondisi in ("segar", "pusing", "lemas"):
+        jumlah = 0
+        total_tidur = 0
+        total_air = 0
+        for d in data:
+            if d["kebugaran"] == kondisi:
+                jumlah += 1
+                total_tidur += d["durasi_tidur"]
+                total_air += int(d["total_air"])
+        if jumlah > 0:
+            rata_tidur[kondisi] = total_tidur / jumlah
+            rata_air[kondisi] = total_air / jumlah
+            print(f"- {kondisi:6s}: tidur {format_durasi(int(rata_tidur[kondisi]))}, "
+                  f"air {rata_air[kondisi]:.0f} ml ({jumlah} hari)")
+
+    # 4. kesimpulan sederhana (hari segar dibandingkan hari tidak segar)
+    if "segar" in rata_tidur and len(rata_tidur) > 1:
+        total_tidur_lain = 0
+        total_air_lain = 0
+        for kondisi in rata_tidur:
+            if kondisi != "segar":
+                total_tidur_lain += rata_tidur[kondisi]
+                total_air_lain += rata_air[kondisi]
+        banyak_lain = len(rata_tidur) - 1
+        tidur_lain = total_tidur_lain / banyak_lain
+        air_lain = total_air_lain / banyak_lain
+
+        print("\nKesimpulan:")
+        if rata_tidur["segar"] > tidur_lain:
+            print("- Saat tubuh segar, tidurnya cenderung lebih lama.")
+        else:
+            print("- Durasi tidur belum terlihat berpengaruh pada rasa segar.")
+        if rata_air["segar"] > air_lain:
+            print("- Saat tubuh segar, air yang diminum cenderung lebih banyak.")
+        else:
+            print("- Jumlah air minum belum terlihat berpengaruh pada rasa segar.")
+    else:
+        print("\nData belum cukup untuk membandingkan kondisi segar dengan yang lain.")
+
+#  BAGIAN 7 : PANTAU ANAK (KHUSUS ORANG TUA)
+def menu_pantau_anak():
+    """Menu pantau anak."""
+    while True:
+        bersihkan_layar()
+        print("=== PANTAU ANAK ===")
+        print("1. Tambah akun anak")
+        print("2. Lihat ringkasan & korelasi anak")
+        print("3. Atur target minum anak")
+        print("4. Hapus akun anak")
+        print("0. Kembali")
+        pilihan = input("Pilih menu: ")
+        bersihkan_layar()
+
+        match pilihan:
+            case "1":
+                tambah_anak()
+                jeda()
+            case "2":
+                lihat_ringkasan_anak()
+                jeda()
+            case "3":
+                atur_target_anak()
+                jeda()
+            case "4":
+                hapus_akun_anak()
+                jeda()
+            case "0":
+                return
+            case _:
+                print("Pilihan tidak valid!")
+                jeda()
+
+def daftar_anak(id_ortu):
+    """Mengambil hanya akun anak yang didaftarkan oleh orang tua ini."""
+    return ambil_semua(
+        "SELECT * FROM pengguna WHERE id_role = %s AND id_ortu = %s ORDER BY id_pengguna",
+        (ROLE_ANAK, id_ortu)
+    )
+
+def tambah_anak():
+    """Orang tua membuatkan akun untuk anak (terhubung ke akun orang tua ini)."""
+    print("--- TAMBAH AKUN ANAK ---")
+    nama = input("Nama anak     : ").strip()
+    username = input("Username anak : ").strip()
+    sandi = input(f"Kata sandi ({MIN_SANDI}-{MAKS_SANDI} karakter) : ").strip()
+
+    if nama == "" or username == "" or sandi == "":
+        print("Semua data wajib diisi!")
+        return
+    if not sandi_valid(sandi):
+        return
+    if nama_sudah_ada(nama):
+        print("Nama sudah dipakai, gunakan nama yang berbeda!")
+        return
+    if username_sudah_ada(username):
+        print("Username sudah dipakai, gunakan username lain!")
+        return
+
+    jalankan(
+        "INSERT INTO pengguna (id_pengguna, id_role, nama_pengguna, username, password, "
+        "target_harian, id_ortu) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (id_berikutnya("pengguna", "id_pengguna"), ROLE_ANAK, nama, username, sandi,
+         TARGET_AWAL, pengguna_aktif["id_pengguna"])
+    )
+    print("Akun anak berhasil dibuat.")
+
+def pilih_anak():
+    """Menampilkan daftar anak milik orang tua yang login, lalu memilih nomornya."""
+    daftar = daftar_anak(pengguna_aktif["id_pengguna"])
+    if len(daftar) == 0:
+        print("Kamu belum punya akun anak.")
+        print("Tambahkan lewat menu 'Tambah akun anak'.")
+        return None
+
+    print("--- DAFTAR ANAK ---")
+    nomor = 1
+    for a in daftar:
+        print(f"{nomor}. {a['nama_pengguna']} | target {a['target_harian']} ml")
+        nomor += 1
+
+    pilih = minta_angka("Pilih nomor anak (0 untuk batal): ", 0, len(daftar))
+    if pilih == 0:
+        return None
+    return daftar[pilih - 1]
+
+def atur_target_anak():
+    """Orang tua menentukan target minum anak."""
+    anak = pilih_anak()
+    if anak is None:
+        return
+    atur_target(anak["id_pengguna"])
+
+def lihat_ringkasan_anak():
+    """Menampilkan progress minum hari ini, riwayat tidur, dan korelasi anak."""
+    anak = pilih_anak()
+    if anak is None:
+        return
+    bersihkan_layar()
+    print(f"=== RINGKASAN {anak['nama_pengguna']} HARI INI ===")
+    total = total_air_tanggal(anak["id_pengguna"], date.today())
+    tampilkan_progress(total, anak["target_harian"])
+    riwayat_tidur(anak["id_pengguna"])
+    print()
+    korelasi_kesehatan(anak["id_pengguna"], anak["nama_pengguna"])
+
+def hapus_akun_anak():
+    """Orang tua menghapus akun anak."""
+    anak = pilih_anak()
+    if anak is None:
+        return
+    yakin = konfirmasi_ya(f"Yakin menghapus akun anak {anak['nama_pengguna']}? Ketik ya untuk lanjut: ")
+    if yakin:
+        hapus_data_pengguna(anak["id_pengguna"])
+        print("Akun anak berhasil dihapus.")
+    else:
+        print("Penghapusan dibatalkan.")
+
+main()
